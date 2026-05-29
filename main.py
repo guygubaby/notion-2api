@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -32,6 +33,20 @@ app = FastAPI(
     description=settings.DESCRIPTION,
     lifespan=lifespan
 )
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started_at = time.time()
+    response = await call_next(request)
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    logger.info(
+        "HTTP %s %s -> %s (%sms)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 async def verify_api_key(
     authorization: Optional[str] = Header(None),
@@ -194,6 +209,13 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content=_openai_error_payload(str(exc.detail), error_type),
+    )
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=_openai_error_payload(str(exc), "invalid_request_error"),
     )
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
