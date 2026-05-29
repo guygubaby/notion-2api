@@ -133,6 +133,8 @@ def _responses_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": input_tokens + output_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
     }
 
 def _chat_usage(usage: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
@@ -145,6 +147,8 @@ def _chat_usage(usage: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         "total_tokens": input_tokens + output_tokens,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
     }
 
 def _openai_error_payload(message: str, error_type: str = "api_error") -> Dict[str, Any]:

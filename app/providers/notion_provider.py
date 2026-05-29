@@ -178,6 +178,8 @@ class NotionAIProvider(BaseProvider):
             "total_tokens": input_tokens + output_tokens,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         }
 
     async def chat_completion(self, request_data: Dict[str, Any]):
@@ -715,6 +717,8 @@ class NotionAIProvider(BaseProvider):
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         }
         model_data = {
             "object": "list",
