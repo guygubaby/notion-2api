@@ -270,7 +270,10 @@ class NotionAIProvider(BaseProvider):
             except Exception as e:
                 error_message = f"处理 Notion AI 流时发生意外错误: {str(e)}"
                 logger.error(error_message, exc_info=True)
-                error_chunk = {"error": {"message": error_message, "type": "internal_server_error"}}
+                error_chunk = {
+                    "error": {"message": error_message, "type": "internal_server_error"},
+                    "usage": self._estimate_usage(request_data, ""),
+                }
                 yield create_sse_data(error_chunk)
                 yield DONE_CHUNK
 
@@ -705,11 +708,19 @@ class NotionAIProvider(BaseProvider):
         return results
 
     async def get_models(self) -> JSONResponse:
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
         model_data = {
             "object": "list",
             "data": [
-                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6", "usage": usage}
                 for name in settings.KNOWN_MODELS
-            ]
+            ],
+            "usage": usage,
         }
         return JSONResponse(content=model_data)
