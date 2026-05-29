@@ -254,14 +254,15 @@ class NotionAIProvider(BaseProvider):
         async def stream_generator() -> AsyncGenerator[bytes, None]:
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
-                role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
+                empty_usage = self._estimate_usage(request_data, "")
+                role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant", usage=empty_usage)
                 yield create_sse_data(role_chunk)
                 model_name, cleaned_response = await collect_response()
+                usage = self._estimate_usage(request_data, cleaned_response)
                 if cleaned_response:
-                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
+                    chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response, usage=usage)
                     yield create_sse_data(chunk)
 
-                usage = self._estimate_usage(request_data, cleaned_response)
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop", usage=usage)
                 yield create_sse_data(final_chunk)
                 yield DONE_CHUNK

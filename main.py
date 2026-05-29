@@ -29,11 +29,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-async def verify_api_key(authorization: Optional[str] = Header(None)):
+async def verify_api_key(
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key")
+):
     if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
-        if not authorization or "bearer" not in authorization.lower():
-            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
-        token = authorization.split(" ")[-1]
+        token = x_api_key
+        if not token and authorization and "bearer" in authorization.lower():
+            token = authorization.split(" ")[-1]
+        if not token:
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 或 x-api-key 认证。")
         if token != settings.API_MASTER_KEY:
             raise HTTPException(status_code=403, detail="无效的 API Key。")
 
