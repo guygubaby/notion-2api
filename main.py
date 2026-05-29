@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
 from app.providers.notion_provider import NotionAIProvider
@@ -118,6 +119,30 @@ def _responses_usage(usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "total_tokens": input_tokens + output_tokens,
     }
 
+def _chat_usage(usage: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    usage = usage or {}
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+    return {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+def _openai_error_payload(message: str, error_type: str = "api_error") -> Dict[str, Any]:
+    usage = _chat_usage()
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": None,
+        },
+        "usage": usage,
+    }
+
 def _create_response_object(response_id: str, model: str, content: str, usage: Dict[str, Any]) -> Dict[str, Any]:
     message_id = f"msg_{uuid.uuid4().hex}"
     return {
@@ -163,7 +188,16 @@ def _create_response_object(response_id: str, model: str, content: str, usage: D
 def _responses_sse_event(event: str, data: Dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    error_type = "invalid_request_error" if exc.status_code == 404 else "api_error"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_openai_error_payload(str(exc.detail), error_type),
+    )
+
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+@app.post("/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request) -> StreamingResponse:
     try:
         request_data = await request.json()
@@ -172,9 +206,13 @@ async def chat_completions(request: Request) -> StreamingResponse:
         raise
     except Exception as e:
         logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
+        )
 
 @app.post("/v1/responses", dependencies=[Depends(verify_api_key)])
+@app.post("/responses", dependencies=[Depends(verify_api_key)])
 async def responses(request: Request):
     try:
         request_data = await request.json()
@@ -249,9 +287,13 @@ async def responses(request: Request):
         raise
     except Exception as e:
         logger.error(f"处理 OpenAI Responses 请求时发生顶层错误: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
+        )
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+@app.get("/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 async def list_models():
     return await provider.get_models()
 
