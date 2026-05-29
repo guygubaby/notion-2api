@@ -151,6 +151,22 @@ def _chat_usage(usage: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
         "cache_read_input_tokens": 0,
     }
 
+def _anthropic_usage(usage: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    normalized = _chat_usage(usage)
+    return {
+        "input_tokens": normalized["input_tokens"],
+        "output_tokens": normalized["output_tokens"],
+        "cache_creation_input_tokens": normalized["cache_creation_input_tokens"],
+        "cache_read_input_tokens": normalized["cache_read_input_tokens"],
+    }
+
+def _estimate_input_tokens_from_messages(request_data: Dict[str, Any]) -> int:
+    text = _extract_openai_text(request_data.get("system", ""))
+    for message in request_data.get("messages", []):
+        if isinstance(message, dict):
+            text += _extract_openai_text(message.get("content", ""))
+    return max(0, len(text) // 4)
+
 def _openai_error_payload(message: str, error_type: str = "api_error") -> Dict[str, Any]:
     usage = _chat_usage()
     return {
@@ -168,9 +184,19 @@ def _model_data(model_id: str) -> Dict[str, Any]:
         "id": model_id,
         "object": "model",
         "created": int(time.time()),
-        "owned_by": "notion",
-        "usage": _chat_usage(),
+        "owned_by": "system",
     }
+
+def _anthropic_model_data(model_id: str) -> Dict[str, Any]:
+    return {
+        "id": model_id,
+        "type": "model",
+        "display_name": model_id,
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+
+def _is_anthropic_request(request: Request) -> bool:
+    return "anthropic-version" in request.headers or "anthropic-beta" in request.headers
 
 def _sse_data(data: Dict[str, Any]) -> bytes:
     return f"data: {json.dumps(data)}\n\n".encode("utf-8")
@@ -237,6 +263,47 @@ def _create_response_object(response_id: str, model: str, content: str, usage: D
 def _responses_sse_event(event: str, data: Dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
+def _messages_to_chat_request(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    messages: List[Dict[str, str]] = []
+    system_text = _extract_openai_text(request_data.get("system"))
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+
+    for message in request_data.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "user")
+        content = _extract_openai_text(message.get("content", ""))
+        if not content:
+            continue
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        messages.append({"role": role, "content": content})
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    return {
+        "model": request_data.get("model", settings.DEFAULT_MODEL),
+        "stream": False,
+        "messages": messages,
+    }
+
+def _create_anthropic_message(message_id: str, model: str, content: str, usage: Dict[str, int]) -> Dict[str, Any]:
+    return {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": usage,
+    }
+
+def _anthropic_sse_event(event: str, data: Dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     error_type = "invalid_request_error" if exc.status_code == 404 else "api_error"
@@ -262,6 +329,75 @@ async def chat_completions(request: Request) -> StreamingResponse:
         raise
     except Exception as e:
         logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
+        )
+
+@app.post("/v1/messages/count_tokens", dependencies=[Depends(verify_api_key)])
+@app.post("/messages/count_tokens", dependencies=[Depends(verify_api_key)])
+async def messages_count_tokens(request: Request):
+    try:
+        request_data = await request.json()
+        input_tokens = _estimate_input_tokens_from_messages(request_data)
+        return JSONResponse(content={
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"处理 Claude Code token 统计请求时发生顶层错误: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
+        )
+
+@app.post("/v1/messages", dependencies=[Depends(verify_api_key)])
+@app.post("/messages", dependencies=[Depends(verify_api_key)])
+async def messages(request: Request):
+    try:
+        request_data = await request.json()
+        chat_request = _messages_to_chat_request(request_data)
+        response = await provider.chat_completion(chat_request)
+        chat_data = json.loads(response.body.decode("utf-8"))
+        content = chat_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        model = request_data.get("model", chat_data.get("model", settings.DEFAULT_MODEL))
+        usage = _anthropic_usage(chat_data.get("usage"))
+        message_id = f"msg_{uuid.uuid4().hex}"
+        message_data = _create_anthropic_message(message_id, model, content, usage)
+
+        if request_data.get("stream"):
+            async def stream_generator():
+                start_message = {**message_data, "content": [], "usage": _anthropic_usage(None)}
+                yield _anthropic_sse_event("message_start", {"type": "message_start", "message": start_message})
+                yield _anthropic_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                if content:
+                    yield _anthropic_sse_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": content},
+                    })
+                yield _anthropic_sse_event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                yield _anthropic_sse_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": usage["output_tokens"]},
+                })
+                yield _anthropic_sse_event("message_stop", {"type": "message_stop"})
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        return JSONResponse(content=message_data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"处理 Claude Code messages 请求时发生顶层错误: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
@@ -438,12 +574,22 @@ async def retrieve_response(response_id: str):
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 @app.get("/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
-async def list_models():
+async def list_models(request: Request):
+    if _is_anthropic_request(request):
+        data = [_anthropic_model_data(name) for name in settings.KNOWN_MODELS]
+        return JSONResponse(content={
+            "data": data,
+            "has_more": False,
+            "first_id": data[0]["id"] if data else None,
+            "last_id": data[-1]["id"] if data else None,
+        })
     return await provider.get_models()
 
 @app.get("/v1/models/{model_id}", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 @app.get("/models/{model_id}", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
-async def retrieve_model(model_id: str):
+async def retrieve_model(model_id: str, request: Request):
+    if _is_anthropic_request(request):
+        return JSONResponse(content=_anthropic_model_data(model_id))
     return JSONResponse(content=_model_data(model_id))
 
 @app.get("/", summary="根路径")

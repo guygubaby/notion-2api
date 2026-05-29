@@ -161,14 +161,28 @@ class NotionAIProvider(BaseProvider):
         for name, morsel in parsed.items():
             session.cookies.set(name, morsel.value, domain=".notion.so", path="/")
 
+    def _content_to_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = [self._content_to_text(item) for item in content]
+            return "\n".join(part for part in parts if part)
+
+        if isinstance(content, dict):
+            for key in ("text", "content", "input", "result"):
+                value = content.get(key)
+                if isinstance(value, (str, list, dict)):
+                    text = self._content_to_text(value)
+                    if text:
+                        return text
+
+        return ""
+
     def _estimate_usage(self, request_data: Dict[str, Any], completion: str) -> Dict[str, int]:
         prompt_text = ""
         for message in request_data.get("messages", []):
-            content = message.get("content", "")
-            if isinstance(content, str):
-                prompt_text += content
-            elif isinstance(content, list):
-                prompt_text += json.dumps(content, ensure_ascii=False)
+            prompt_text += self._content_to_text(message.get("content", ""))
 
         input_tokens = max(0, len(prompt_text) // 4)
         output_tokens = max(0, len(completion) // 4)
@@ -562,16 +576,24 @@ class NotionAIProvider(BaseProvider):
         ]
 
         for msg in request_data.get("messages", []):
-            if msg.get("role") == "user":
+            role = msg.get("role")
+            content = self._content_to_text(msg.get("content", ""))
+            if not content:
+                continue
+
+            if role == "system":
+                content = f"System instruction:\n{content}"
+
+            if role in ("user", "system"):
                 transcript.append({
                     "id": str(uuid.uuid4()),
                     "type": "user",
-                    "value": [[msg.get("content")]],
+                    "value": [[content]],
                     "userId": settings.NOTION_USER_ID,
                     "createdAt": datetime.now().astimezone().isoformat()
                 })
-            elif msg.get("role") == "assistant":
-                transcript.append({"id": str(uuid.uuid4()), "type": "agent-inference", "value": [{"type": "text", "content": msg.get("content")}]})
+            elif role == "assistant":
+                transcript.append({"id": str(uuid.uuid4()), "type": "agent-inference", "value": [{"type": "text", "content": content}]})
 
         payload = {
             "traceId": str(uuid.uuid4()),
@@ -711,21 +733,11 @@ class NotionAIProvider(BaseProvider):
         return results
 
     async def get_models(self) -> JSONResponse:
-        usage = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        }
         model_data = {
             "object": "list",
             "data": [
-                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6", "usage": usage}
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "system"}
                 for name in settings.KNOWN_MODELS
             ],
-            "usage": usage,
         }
         return JSONResponse(content=model_data)
