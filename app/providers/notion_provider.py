@@ -196,8 +196,14 @@ class NotionAIProvider(BaseProvider):
             "cache_read_input_tokens": 0,
         }
 
+    def _is_stream_request(self, request_data: Dict[str, Any]) -> bool:
+        stream = request_data.get("stream", False)
+        if isinstance(stream, str):
+            return stream.lower() == "true"
+        return bool(stream)
+
     async def chat_completion(self, request_data: Dict[str, Any]):
-        stream = request_data.get("stream", True)
+        stream = self._is_stream_request(request_data)
         request_id = f"chatcmpl-{uuid.uuid4()}"
 
         async def collect_response() -> Tuple[str, str]:
