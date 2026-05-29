@@ -50,7 +50,7 @@ notion-2api/
 ├── Dockerfile              # Docker 镜像构建文件
 ├── docker-compose.yml      # Docker Compose 编排文件
 ├── main.py                 # FastAPI 应用主入口
-├── nginx.conf              # Nginx 反向代理配置
+├── nginx.conf.template     # Nginx 反向代理配置模板
 ├── requirements.txt        # Python 依赖列表
 └── app/
     ├── core/
@@ -158,8 +158,8 @@ graph TD
    # 安全配置（可选）
    API_MASTER_KEY=your_secret_key_here
    
-   # 部署配置
-   NGINX_PORT=8088
+   # 部署配置，host 网络模式下 nginx 直接监听这个宿主机端口
+   NGINX_PORT=4002
    
    # Notion 凭证（必需）
    # 建议填写浏览器请求里的完整 Cookie；只填 token_v2 可能无法访问 Notion AI 接口
@@ -172,6 +172,8 @@ graph TD
    NOTION_USER_EMAIL="your_email@example.com"
    NOTION_CLIENT_VERSION="23.13.20260529.0633"
    NOTION_REFERER="https://www.notion.so/"
+   # 可选：访问 Notion 上游接口使用的代理
+   NOTION_PROXY="127.0.0.1:7890"
    ```
 
 ### 启动服务
@@ -183,7 +185,7 @@ docker-compose up -d --build
 ### 测试 API
 
 ```bash
-curl http://localhost:8088/v1/chat/completions \
+curl http://localhost:4002/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your_secret_key_here" \
   -d '{
@@ -235,7 +237,7 @@ async def chat_completions(
 class Settings(BaseSettings):
     """应用配置模型，自动从环境变量加载"""
     API_MASTER_KEY: str = "1"
-    NGINX_PORT: int = 8088
+    NGINX_PORT: int = 4002
     NOTION_COOKIE: str
     NOTION_SPACE_ID: str
     NOTION_USER_ID: str

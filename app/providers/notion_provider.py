@@ -41,11 +41,25 @@ class NotionAIProvider(BaseProvider):
                 accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             )
             target_scraper = scraper or self.scraper
-            response = target_scraper.get("https://www.notion.so/", headers=headers, timeout=30)
+            response = target_scraper.get(
+                "https://www.notion.so/",
+                headers=headers,
+                timeout=30,
+                proxies=self._prepare_proxies(),
+            )
             response.raise_for_status()
             logger.info("会话预热成功。")
         except Exception as e:
             logger.error(f"会话预热失败: {e}", exc_info=True)
+
+    def _prepare_proxies(self) -> Optional[Dict[str, str]]:
+        proxy = (settings.NOTION_PROXY or "").strip()
+        if not proxy:
+            return None
+
+        if "://" not in proxy:
+            proxy = f"http://{proxy}"
+        return {"http": proxy, "https": proxy}
 
     def _format_response_error(self, response: Optional[requests.Response]) -> str:
         if response is None:
@@ -96,6 +110,9 @@ class NotionAIProvider(BaseProvider):
         headers = dict(headers)
         cookie_header = headers.pop("Cookie", "")
         self._load_cookies_into_session(session, cookie_header)
+        proxies = self._prepare_proxies()
+        if proxies:
+            session.proxies.update(proxies)
 
         for attempt in range(1, attempts + 1):
             try:
@@ -130,6 +147,8 @@ class NotionAIProvider(BaseProvider):
                 session.close()
                 session = requests.Session()
                 self._load_cookies_into_session(session, cookie_header)
+                if proxies:
+                    session.proxies.update(proxies)
 
         raise HTTPException(status_code=502, detail=f"{action}失败：Notion 上游连接异常: {last_error}")
 

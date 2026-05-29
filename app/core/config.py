@@ -26,9 +26,10 @@ class Settings(BaseSettings):
     NOTION_BLOCK_ID: Optional[str] = None
     NOTION_CLIENT_VERSION: Optional[str] = "23.13.20260529.0633"
     NOTION_REFERER: Optional[str] = "https://www.notion.so/"
+    NOTION_PROXY: Optional[str] = None
 
     API_REQUEST_TIMEOUT: int = 180
-    NGINX_PORT: int = 8088
+    NGINX_PORT: int = 4002
 
     # 【最终修正】更新所有已知的模型列表
     DEFAULT_MODEL: str = "gpt-5.2"
