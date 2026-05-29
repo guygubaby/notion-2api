@@ -11,7 +11,7 @@ services:
       NGINX_PORT: ${NGINX_PORT:-4002}
       APP_PORT: ${APP_PORT:-4003}
     volumes:
-      - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
     depends_on:
       - app
 
