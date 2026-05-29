@@ -34,3 +34,25 @@ def create_chat_completion_chunk(
             }
         ]
     }
+
+def create_chat_completion_response(
+    request_id: str,
+    model: str,
+    content: str
+) -> Dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }
+        ]
+    }

@@ -5,6 +5,8 @@ import logging
 import uuid
 import re
 import cloudscraper
+import requests
+from http.cookies import SimpleCookie
 from typing import Dict, Any, AsyncGenerator, List, Optional, Tuple
 from datetime import datetime
 
@@ -14,7 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.providers.base_provider import BaseProvider
-from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, create_chat_completion_response, DONE_CHUNK
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
@@ -24,131 +26,202 @@ class NotionAIProvider(BaseProvider):
         self.scraper = cloudscraper.create_scraper()
         self.api_endpoints = {
             "runInference": "https://www.notion.so/api/v3/runInferenceTranscript",
-            "saveTransactions": "https://www.notion.so/api/v3/saveTransactionsFanout"
+            "syncRecordValues": "https://www.notion.so/api/v3/syncRecordValuesSpaceInitial",
         }
-        
+
         if not all([settings.NOTION_COOKIE, settings.NOTION_SPACE_ID, settings.NOTION_USER_ID]):
             raise ValueError("配置错误: NOTION_COOKIE, NOTION_SPACE_ID 和 NOTION_USER_ID 必须在 .env 文件中全部设置。")
 
         self._warmup_session()
 
-    def _warmup_session(self):
+    def _warmup_session(self, scraper: Optional[Any] = None):
         try:
             logger.info("正在进行会话预热 (Session Warm-up)...")
-            headers = self._prepare_headers()
-            headers.pop("Accept", None)
-            response = self.scraper.get("https://www.notion.so/", headers=headers, timeout=30)
+            headers = self._prepare_headers(
+                accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            )
+            target_scraper = scraper or self.scraper
+            response = target_scraper.get("https://www.notion.so/", headers=headers, timeout=30)
             response.raise_for_status()
             logger.info("会话预热成功。")
         except Exception as e:
             logger.error(f"会话预热失败: {e}", exc_info=True)
-            
-    async def _create_thread(self, thread_type: str) -> str:
-        thread_id = str(uuid.uuid4())
-        payload = {
-            "requestId": str(uuid.uuid4()),
-            "transactions": [{
-                "id": str(uuid.uuid4()),
-                "spaceId": settings.NOTION_SPACE_ID,
-                "operations": [{
-                    "pointer": {"table": "thread", "id": thread_id, "spaceId": settings.NOTION_SPACE_ID},
-                    "path": [],
-                    "command": "set",
-                    "args": {
-                        "id": thread_id, "version": 1, "parent_id": settings.NOTION_SPACE_ID,
-                        "parent_table": "space", "space_id": settings.NOTION_SPACE_ID,
-                        "created_time": int(time.time() * 1000),
-                        "created_by_id": settings.NOTION_USER_ID, "created_by_table": "notion_user",
-                        "messages": [], "data": {}, "alive": True, "type": thread_type
-                    }
-                }]
-            }]
-        }
+
+    def _format_response_error(self, response: Optional[requests.Response]) -> str:
+        if response is None:
+            return ""
+
+        body = response.text[:500] if response.text else ""
+        return f"status={response.status_code}, body={body}"
+
+    def _notion_error_detail(self, response: Optional[requests.Response]) -> str:
+        if response is None or not response.text:
+            return ""
+
         try:
-            logger.info(f"正在创建新的对话线程 (type: {thread_type})...")
-            response = await run_in_threadpool(
-                lambda: self.scraper.post(
-                    self.api_endpoints["saveTransactions"],
-                    headers=self._prepare_headers(),
+            data = response.json()
+        except ValueError:
+            return ""
+
+        parts = []
+        name = data.get("name")
+        if isinstance(name, str) and name:
+            parts.append(name)
+
+        client_data = data.get("clientData")
+        if isinstance(client_data, dict):
+            error_type = client_data.get("type")
+            if isinstance(error_type, str) and error_type:
+                parts.append(error_type)
+
+        debug_message = data.get("debugMessage")
+        if isinstance(debug_message, str) and debug_message:
+            parts.append(debug_message)
+
+        return " / ".join(parts)
+
+    def _post_json_with_retry(
+        self,
+        url: str,
+        *,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        timeout: int,
+        action: str,
+        stream: bool = False,
+        attempts: int = 2,
+    ) -> requests.Response:
+        last_error: Optional[Exception] = None
+        session = requests.Session()
+        headers = dict(headers)
+        cookie_header = headers.pop("Cookie", "")
+        self._load_cookies_into_session(session, cookie_header)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                response = session.post(
+                    url,
+                    headers=headers,
                     json=payload,
-                    timeout=20
+                    timeout=timeout,
+                    stream=stream
                 )
-            )
-            response.raise_for_status()
-            logger.info(f"对话线程创建成功, Thread ID: {thread_id}")
-            return thread_id
-        except Exception as e:
-            logger.error(f"创建对话线程失败: {e}", exc_info=True)
-            raise Exception("无法创建新的对话线程。")
+                response.raise_for_status()
+                return response
+            except requests.exceptions.HTTPError as e:
+                response = e.response
+                status_code = response.status_code if response is not None else None
+                detail = self._format_response_error(response)
+                logger.error(f"{action}失败: {detail}", exc_info=True)
+
+                if status_code in (401, 403):
+                    notion_detail = self._notion_error_detail(response)
+                    suffix = f" ({notion_detail})" if notion_detail else ""
+                    raise HTTPException(status_code=502, detail=f"{action}失败：Notion 凭证无效或无权限{suffix}。")
+                if status_code is not None and status_code < 500:
+                    raise HTTPException(status_code=502, detail=f"{action}失败：Notion 返回 {status_code}。")
+
+                last_error = e
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                logger.warning(f"{action}第 {attempt}/{attempts} 次请求失败: {e}", exc_info=True)
+
+            if attempt < attempts:
+                session.close()
+                session = requests.Session()
+                self._load_cookies_into_session(session, cookie_header)
+
+        raise HTTPException(status_code=502, detail=f"{action}失败：Notion 上游连接异常: {last_error}")
+
+    def _load_cookies_into_session(self, session: requests.Session, cookie_header: str):
+        if not cookie_header:
+            return
+
+        parsed = SimpleCookie()
+        parsed.load(cookie_header)
+        for name, morsel in parsed.items():
+            session.cookies.set(name, morsel.value, domain=".notion.so", path="/")
 
     async def chat_completion(self, request_data: Dict[str, Any]):
         stream = request_data.get("stream", True)
+        request_id = f"chatcmpl-{uuid.uuid4()}"
 
-        async def stream_generator() -> AsyncGenerator[bytes, None]:
-            request_id = f"chatcmpl-{uuid.uuid4()}"
+        async def collect_response() -> Tuple[str, str]:
+            model_name = request_data.get("model", settings.DEFAULT_MODEL)
+            mapped_model = settings.MODEL_MAP.get(model_name, settings.MODEL_MAP.get(settings.DEFAULT_MODEL, "oatmeal-cookie"))
             incremental_fragments: List[str] = []
             final_message: Optional[str] = None
-            
+
+            thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
+
+            thread_id = str(uuid.uuid4())
+            payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
+            headers = self._prepare_headers(accept="application/x-ndjson")
+
+            def sync_stream_iterator():
+                try:
+                    logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
+                    logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
+
+                    response = self._post_json_with_retry(
+                        self.api_endpoints['runInference'],
+                        headers=headers,
+                        payload=payload,
+                        stream=True,
+                        timeout=settings.API_REQUEST_TIMEOUT,
+                        action="请求 Notion AI",
+                    )
+                    for line in response.iter_lines():
+                        if line:
+                            yield line
+                except Exception as e:
+                    yield e
+
+            sync_gen = sync_stream_iterator()
+
+            while True:
+                line = await run_in_threadpool(lambda: next(sync_gen, None))
+                if line is None:
+                    break
+                if isinstance(line, Exception):
+                    raise line
+
+                parsed_results = self._parse_ndjson_line_to_texts(line)
+                for text_type, content in parsed_results:
+                    if text_type == 'final':
+                        final_message = content
+                    elif text_type == 'incremental':
+                        incremental_fragments.append(content)
+
+            full_response = ""
+            if final_message:
+                full_response = final_message
+                logger.info(f"成功从 record-map 或 Gemini patch/event 中提取到最终消息。")
+            else:
+                full_response = "".join(incremental_fragments)
+                logger.info(f"使用拼接所有增量片段的方式获得最终消息。")
+
+            if not full_response:
+                polled_response = await self._poll_final_response(thread_id)
+                if polled_response:
+                    return model_name, self._clean_content(polled_response)
+
+                logger.warning("警告: Notion 返回的数据流和轮询结果中均未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
+                return model_name, ""
+
+            cleaned_response = self._clean_content(full_response)
+            logger.info(f"清洗后的最终响应: {cleaned_response}")
+            return model_name, cleaned_response
+
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
             try:
                 model_name = request_data.get("model", settings.DEFAULT_MODEL)
-                mapped_model = settings.MODEL_MAP.get(model_name, "anthropic-sonnet-alt")
-                
-                thread_type = "markdown-chat" if mapped_model.startswith("vertex-") else "workflow"
-                
-                thread_id = await self._create_thread(thread_type)
-                payload = self._prepare_payload(request_data, thread_id, mapped_model, thread_type)
-                headers = self._prepare_headers()
-
                 role_chunk = create_chat_completion_chunk(request_id, model_name, role="assistant")
                 yield create_sse_data(role_chunk)
-
-                def sync_stream_iterator():
-                    try:
-                        logger.info(f"请求 Notion AI URL: {self.api_endpoints['runInference']}")
-                        logger.info(f"请求体: {json.dumps(payload, indent=2, ensure_ascii=False)}")
-                        
-                        response = self.scraper.post(
-                            self.api_endpoints['runInference'], headers=headers, json=payload, stream=True,
-                            timeout=settings.API_REQUEST_TIMEOUT
-                        )
-                        response.raise_for_status()
-                        for line in response.iter_lines():
-                            if line:
-                                yield line
-                    except Exception as e:
-                        yield e
-
-                sync_gen = sync_stream_iterator()
-              
-                while True:
-                    line = await run_in_threadpool(lambda: next(sync_gen, None))
-                    if line is None:
-                        break
-                    if isinstance(line, Exception):
-                        raise line
-
-                    parsed_results = self._parse_ndjson_line_to_texts(line)
-                    for text_type, content in parsed_results:
-                        if text_type == 'final':
-                            final_message = content
-                        elif text_type == 'incremental':
-                            incremental_fragments.append(content)
-              
-                full_response = ""
-                if final_message:
-                    full_response = final_message
-                    logger.info(f"成功从 record-map 或 Gemini patch/event 中提取到最终消息。")
-                else:
-                    full_response = "".join(incremental_fragments)
-                    logger.info(f"使用拼接所有增量片段的方式获得最终消息。")
-
-                if full_response:
-                    cleaned_response = self._clean_content(full_response)
-                    logger.info(f"清洗后的最终响应: {cleaned_response}")
+                model_name, cleaned_response = await collect_response()
+                if cleaned_response:
                     chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                     yield create_sse_data(chunk)
-                else:
-                    logger.warning("警告: Notion 返回的数据流中未提取到任何有效文本。请检查您的 .env 配置是否全部正确且凭证有效。")
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
                 yield create_sse_data(final_chunk)
@@ -163,25 +236,156 @@ class NotionAIProvider(BaseProvider):
 
         if stream:
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
-        else:
-            raise HTTPException(status_code=400, detail="此端点当前仅支持流式响应 (stream=true)。")
 
-    def _prepare_headers(self) -> Dict[str, str]:
+        model_name, cleaned_response = await collect_response()
+        return JSONResponse(content=create_chat_completion_response(request_id, model_name, cleaned_response))
+
+    async def _poll_final_response(self, thread_id: str) -> str:
+        last_message_ids: List[str] = []
+        for _ in range(20):
+            await run_in_threadpool(lambda: time.sleep(1.5))
+            try:
+                thread_data = await self._sync_thread(thread_id)
+                message_ids = self._message_ids_from_thread_record(thread_data, thread_id)
+                if not message_ids:
+                    continue
+
+                last_message_ids = message_ids
+                message_data = await self._sync_thread_messages(thread_id, message_ids)
+                content = self._extract_agent_text_from_record_map(message_data.get("recordMap", {}), message_ids)
+                if content:
+                    return content
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning(f"轮询 Notion 最终答案失败: {e}", exc_info=True)
+
+        logger.warning(f"轮询 Notion 最终答案超时, thread_id={thread_id}, last_message_ids={last_message_ids}")
+        return ""
+
+    async def _sync_thread(self, thread_id: str) -> Dict[str, Any]:
+        payload = {
+            "requests": [{
+                "pointer": {
+                    "table": "thread",
+                    "id": thread_id,
+                    "spaceId": settings.NOTION_SPACE_ID,
+                },
+                "version": -1,
+            }]
+        }
+        response = await run_in_threadpool(
+            lambda: self._post_json_with_retry(
+                self.api_endpoints["syncRecordValues"],
+                headers=self._prepare_headers(accept="application/json"),
+                payload=payload,
+                timeout=20,
+                action="同步 Notion 线程",
+            )
+        )
+        return response.json()
+
+    async def _sync_thread_messages(self, thread_id: str, message_ids: List[str]) -> Dict[str, Any]:
+        payload = {
+            "requests": [
+                {
+                    "pointer": {
+                        "table": "thread_message",
+                        "id": message_id,
+                        "spaceId": settings.NOTION_SPACE_ID,
+                    },
+                    "version": -1,
+                }
+                for message_id in message_ids
+            ]
+        }
+        response = await run_in_threadpool(
+            lambda: self._post_json_with_retry(
+                self.api_endpoints["syncRecordValues"],
+                headers=self._prepare_headers(accept="application/json"),
+                payload=payload,
+                timeout=20,
+                action="同步 Notion 线程消息",
+            )
+        )
+        return response.json()
+
+    def _message_ids_from_thread_record(self, thread_data: Dict[str, Any], thread_id: str) -> List[str]:
+        record_map = thread_data.get("recordMap", {})
+        thread_record = record_map.get("thread", {}).get(thread_id, {})
+        value = thread_record.get("value", {}).get("value", {})
+        messages = value.get("messages", [])
+        return [message_id for message_id in messages if isinstance(message_id, str) and message_id.strip()]
+
+    def _extract_agent_text_from_record_map(self, record_map: Dict[str, Any], message_ids: List[str]) -> str:
+        thread_messages = record_map.get("thread_message", {})
+        for message_id in reversed(message_ids):
+            message = thread_messages.get(message_id, {})
+            step = message.get("value", {}).get("value", {}).get("step", {})
+            if step.get("type") != "agent-inference":
+                continue
+
+            data = message.get("value", {}).get("value", {}).get("data", {})
+            if data and not data.get("completed", False):
+                continue
+
+            content = self._extract_agent_step_text(step.get("value"))
+            if content:
+                return content
+        return ""
+
+    def _extract_agent_step_text(self, value: Any) -> str:
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if not isinstance(item, dict) or item.get("type") != "text":
+                    continue
+                content = item.get("content")
+                if isinstance(content, str) and content:
+                    parts.append(content)
+            return "".join(parts).strip()
+
+        if isinstance(value, dict):
+            nested_value = value.get("value")
+            if isinstance(nested_value, list):
+                return self._extract_agent_step_text(nested_value)
+            content = value.get("content")
+            if isinstance(content, str):
+                return content.strip()
+
+        if isinstance(value, str):
+            return value.strip()
+
+        return ""
+
+    def _prepare_headers(self, accept: Optional[str] = "application/x-ndjson") -> Dict[str, str]:
         cookie_source = (settings.NOTION_COOKIE or "").strip()
         cookie_header = cookie_source if "=" in cookie_source else f"token_v2={cookie_source}"
 
-        return {
+        headers = {
             "Content-Type": "application/json",
-            "Accept": "application/x-ndjson",
             "Cookie": cookie_header,
             "x-notion-space-id": settings.NOTION_SPACE_ID,
             "x-notion-active-user-header": settings.NOTION_USER_ID,
+            "notion-client-version": settings.NOTION_CLIENT_VERSION,
             "x-notion-client-version": settings.NOTION_CLIENT_VERSION,
             "notion-audit-log-platform": "web",
             "Origin": "https://www.notion.so",
-            "Referer": "https://www.notion.so/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Referer": settings.NOTION_REFERER or "https://www.notion.so/",
+            "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,fr;q=0.6",
+            "Connection": "close",
+            "priority": "u=1, i",
+            "sec-ch-ua": '"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
         }
+        if accept:
+            headers["Accept"] = accept
+        return headers
 
     def _normalize_block_id(self, block_id: str) -> str:
         if not block_id: return block_id
@@ -205,7 +409,7 @@ class NotionAIProvider(BaseProvider):
             context_value["blockId"] = normalized_block_id
 
         config_value: Dict[str, Any]
-        
+
         if mapped_model.startswith("vertex-"):
             logger.info(f"检测到 Gemini 模型 ({mapped_model})，应用特定的 config 和 context。")
             context_value.update({
@@ -230,19 +434,86 @@ class NotionAIProvider(BaseProvider):
         else:
             context_value.update({
                 "userName": settings.NOTION_USER_NAME,
+                "spaceName": settings.NOTION_SPACE_NAME or settings.NOTION_USER_NAME,
                 "surface": "workflows"
             })
+            if settings.NOTION_SPACE_VIEW_ID:
+                context_value["spaceViewId"] = settings.NOTION_SPACE_VIEW_ID
+
             config_value = {
                 "type": thread_type,
-                "model": mapped_model,
+                "enableAgentAutomations": True,
+                "enableAgentIntegrations": True,
+                "enableCustomAgents": True,
+                "enableExperimentalIntegrations": False,
+                "enableAgentDiffs": True,
+                "enableAgentUpdatePagePatch": True,
+                "enableCsvAttachmentSupport": True,
+                "enableDatabaseAgents": True,
+                "showDatabaseAgentsDiscoverability": False,
+                "enableAgentThreadTools": False,
+                "enableCrdtOperations": False,
+                "enableAgentCardCustomization": True,
+                "enableSystemPromptAsPage": False,
+                "enableUserSessionContext": False,
+                "enableLargeToolResultComputerOffload": False,
+                "enableScriptAgentAdvanced": False,
+                "enableScriptAgent": True,
+                "enableScriptAgentSearchConnectorsInCustomAgent": False,
+                "enableScriptAgentGoogleDriveInCustomAgent": False,
+                "enableScriptAgentGoogleDriveOAuthInCustomAgent": False,
+                "enableScriptAgentSlack": True,
+                "enableScriptAgentMcpServers": False,
+                "enableScriptAgentGtm": False,
+                "enableScriptAgentCustomToolCalling": True,
+                "enableComputer": False,
+                "enableCreateAndRunThread": True,
+                "enableSoftwareFactoryPage": False,
+                "enableAgentGenerateImage": False,
+                "enableSpeculativeSearch": False,
+                "enableQueryCalendar": False,
+                "enableQueryMail": False,
+                "enableMailExplicitToolCalls": True,
+                "enableMailNotificationPreferences": False,
+                "enableMailAgentMultiProviderSupport": False,
+                "useRulePrioritization": True,
+                "availableConnectors": [],
+                "customConnectorInfo": [],
+                "searchScopes": [{"type": "everything"}],
+                "useSearchToolV2": False,
                 "useWebSearch": True,
+                "isHipaa": False,
+                "yoloMode": False,
+                "useReadOnlyMode": False,
+                "writerMode": False,
+                "modelFromUser": False,
+                "isCustomAgent": False,
+                "isCustomAgentBuilder": False,
+                "isAgentResearchRequest": False,
+                "useCustomAgentDraft": False,
+                "use_draft_actor_pointer": False,
+                "enableUpdatePageAutofixer": True,
+                "enableMarkdownVNext": False,
+                "updatePageStaleViewGuardEnabled": False,
+                "enableUpdatePageOrderUpdates": True,
+                "enableAgentSupportPropertyReorder": True,
+                "agentShortUpdatePageResult": True,
+                "enableAgentAskSurvey": True,
+                "databaseAgentConfigMode": False,
+                "isOnboardingAgent": False,
+                "isMobile": False,
+                "useContextualCoreDocsAutoLoad": False,
+                "useDocPreviewsForCoreAutoLoad": False,
+                "isThreadStartedByAdmin": True,
             }
+            if mapped_model:
+                config_value["model"] = mapped_model
 
         transcript = [
             {"id": str(uuid.uuid4()), "type": "config", "value": config_value},
             {"id": str(uuid.uuid4()), "type": "context", "value": context_value}
         ]
-      
+
         for msg in request_data.get("messages", []):
             if msg.get("role") == "user":
                 transcript.append({
@@ -260,33 +531,42 @@ class NotionAIProvider(BaseProvider):
             "spaceId": settings.NOTION_SPACE_ID,
             "transcript": transcript,
             "threadId": thread_id,
-            "createThread": False,
-            "isPartialTranscript": True,
+            "createThread": True,
+            "isPartialTranscript": False,
             "asPatchResponse": True,
             "generateTitle": True,
             "saveAllThreadOperations": True,
-            "threadType": thread_type
-        }
-
-        if mapped_model.startswith("vertex-"):
-            logger.info("为 Gemini 请求添加 debugOverrides。")
-            payload["debugOverrides"] = {
+            "threadType": thread_type,
+            "setUnreadState": True,
+            "createdSource": context_value.get("surface", "workflows"),
+            "isUserInAnySalesAssistedSpace": False,
+            "isSpaceSalesAssisted": False,
+            "threadParentPointer": {
+                "table": "space",
+                "id": settings.NOTION_SPACE_ID,
+                "spaceId": settings.NOTION_SPACE_ID,
+            },
+            "debugOverrides": {
                 "emitAgentSearchExtractedResults": True,
                 "cachedInferences": {},
                 "annotationInferences": {},
                 "emitInferences": False
-            }
-        
+            },
+        }
+
+        if mapped_model.startswith("vertex-"):
+            logger.info("为 Gemini 请求添加 debugOverrides。")
+
         return payload
 
     def _clean_content(self, content: str) -> str:
         if not content:
             return ""
-            
+
         content = re.sub(r'<lang primary="[^"]*"\s*/>\n*', '', content)
         content = re.sub(r'<thinking>[\s\S]*?</thinking>\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'<thought>[\s\S]*?</thought>\s*', '', content, flags=re.IGNORECASE)
-        
+
         content = re.sub(r'^.*?Chinese whatmodel I am.*?Theyspecifically.*?requested.*?me.*?to.*?reply.*?in.*?Chinese\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
         content = re.sub(r'^.*?This.*?is.*?a.*?straightforward.*?question.*?about.*?my.*?identity.*?asan.*?AI.*?assistant\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
         content = re.sub(r'^.*?Idon\'t.*?need.*?to.*?use.*?any.*?tools.*?for.*?this.*?-\s*it\'s.*?asimple.*?informational.*?response.*?aboutwhat.*?I.*?am\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
@@ -295,7 +575,7 @@ class NotionAIProvider(BaseProvider):
         content = re.sub(r'^.*?This.*?is.*?a.*?question.*?about.*?my.*?identity.*?not requiring.*?any.*?tool.*?use.*?I.*?should.*?respond.*?directly.*?to.*?the.*?user.*?in.*?Chinese.*?as.*?requested\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
         content = re.sub(r'^.*?I.*?should.*?identify.*?myself.*?as.*?Notion.*?AI.*?as.*?mentioned.*?in.*?the.*?system.*?prompt.*?\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
         content = re.sub(r'^.*?I.*?should.*?not.*?make.*?specific.*?claims.*?about.*?the.*?underlying.*?model.*?architecture.*?since.*?that.*?information.*?is.*?not.*?provided.*?in.*?my.*?context\.\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
-        
+
         return content.strip()
 
     def _parse_ndjson_line_to_texts(self, line: bytes) -> List[Tuple[str, str]]:
@@ -303,10 +583,10 @@ class NotionAIProvider(BaseProvider):
         try:
             s = line.decode("utf-8", errors="ignore").strip()
             if not s: return results
-            
+
             data = json.loads(s)
             logger.debug(f"原始响应数据: {json.dumps(data, ensure_ascii=False)}")
-            
+
             # 格式1: Gemini 返回的 markdown-chat 事件
             if data.get("type") == "markdown-chat":
                 content = data.get("value", "")
@@ -318,32 +598,32 @@ class NotionAIProvider(BaseProvider):
             elif data.get("type") == "patch" and "v" in data:
                 for operation in data.get("v", []):
                     if not isinstance(operation, dict): continue
-                    
+
                     op_type = operation.get("o")
                     path = operation.get("p", "")
                     value = operation.get("v")
-                    
+
                     # 【修改】Gemini 的完整内容 patch 格式
                     if op_type == "a" and path.endswith("/s/-") and isinstance(value, dict) and value.get("type") == "markdown-chat":
                         content = value.get("value", "")
                         if content:
                             logger.info("从 'patch' (Gemini-style) 中提取到完整内容。")
                             results.append(('final', content))
-                    
+
                     # 【修改】Gemini 的增量内容 patch 格式
                     elif op_type == "x" and "/s/" in path and path.endswith("/value") and isinstance(value, str):
                         content = value
                         if content:
                             logger.info(f"从 'patch' (Gemini增量) 中提取到内容: {content}")
                             results.append(('incremental', content))
-                    
+
                     # 【修改】Claude 和 GPT 的增量内容 patch 格式
                     elif op_type == "x" and "/value/" in path and isinstance(value, str):
                         content = value
                         if content:
                             logger.info(f"从 'patch' (Claude/GPT增量) 中提取到内容: {content}")
                             results.append(('incremental', content))
-                    
+
                     # 【修改】Claude 和 GPT 的完整内容 patch 格式
                     elif op_type == "a" and path.endswith("/value/-") and isinstance(value, dict) and value.get("type") == "text":
                         content = value.get("content", "")
@@ -372,15 +652,15 @@ class NotionAIProvider(BaseProvider):
                                     if isinstance(item, dict) and item.get("type") == "text":
                                         content = item.get("content", "")
                                         break
-                        
+
                         if content and isinstance(content, str):
                             logger.info(f"从 record-map (type: {step_type}) 提取到最终内容。")
                             results.append(('final', content))
-                            break 
-    
+                            break
+
         except (json.JSONDecodeError, AttributeError) as e:
             logger.warning(f"解析NDJSON行失败: {e} - Line: {line.decode('utf-8', errors='ignore')}")
-        
+
         return results
 
     async def get_models(self) -> JSONResponse:

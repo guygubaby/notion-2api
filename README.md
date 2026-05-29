@@ -162,11 +162,16 @@ graph TD
    NGINX_PORT=8088
    
    # Notion 凭证（必需）
-   NOTION_COOKIE="你的token_v2值"
+   # 建议填写浏览器请求里的完整 Cookie；只填 token_v2 可能无法访问 Notion AI 接口
+   NOTION_COOKIE="你的完整 Cookie"
    NOTION_SPACE_ID="你的Space ID"
+   NOTION_SPACE_NAME="你的Space名称"
+   NOTION_SPACE_VIEW_ID="runInferenceTranscript context里的spaceViewId，可留空"
    NOTION_USER_ID="你的User ID"
    NOTION_USER_NAME="你的名字"
    NOTION_USER_EMAIL="your_email@example.com"
+   NOTION_CLIENT_VERSION="23.13.20260529.0633"
+   NOTION_REFERER="https://www.notion.so/"
    ```
 
 ### 启动服务
@@ -279,7 +284,7 @@ def create_sse_data(data: dict) -> str:
 ### ⚠️ 限制与挑战
 
 1. **API 稳定性**: 依赖 Notion 非官方接口，存在变更风险
-2. **凭证维护**: `token_v2` 会过期，需要定期更新
+2. **凭证维护**: Notion Cookie 会过期，需要定期更新；Notion AI 接口通常需要完整 Cookie
 3. **防护对抗**: Cloudflare 策略更新可能导致连接失败
 4. **功能局限**: 目前主要支持聊天补全功能
 
@@ -289,7 +294,7 @@ def create_sse_data(data: dict) -> str:
 
 ### 🎯 短期目标
 
-- [ ] 支持非流式响应 (`stream=false`)
+- [x] 支持非流式响应 (`stream=false`)
 - [ ] 增强错误处理和用户反馈
 - [ ] 改进 token 自动刷新机制
 - [ ] 动态模型列表获取

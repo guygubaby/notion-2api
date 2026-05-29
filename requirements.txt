@@ -5,3 +5,4 @@ httpx
 pydantic-settings
 python-dotenv
 cloudscraper
+requests

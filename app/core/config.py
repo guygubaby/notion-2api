@@ -18,35 +18,48 @@ class Settings(BaseSettings):
     # --- Notion 凭证 ---
     NOTION_COOKIE: Optional[str] = None
     NOTION_SPACE_ID: Optional[str] = None
+    NOTION_SPACE_NAME: Optional[str] = None
+    NOTION_SPACE_VIEW_ID: Optional[str] = None
     NOTION_USER_ID: Optional[str] = None
     NOTION_USER_NAME: Optional[str] = None
     NOTION_USER_EMAIL: Optional[str] = None
     NOTION_BLOCK_ID: Optional[str] = None
-    NOTION_CLIENT_VERSION: Optional[str] = "23.13.20251011.2037"
+    NOTION_CLIENT_VERSION: Optional[str] = "23.13.20260529.0633"
+    NOTION_REFERER: Optional[str] = "https://www.notion.so/"
 
     API_REQUEST_TIMEOUT: int = 180
     NGINX_PORT: int = 8088
 
     # 【最终修正】更新所有已知的模型列表
-    DEFAULT_MODEL: str = "claude-sonnet-4.5"
-    
+    DEFAULT_MODEL: str = "gpt-5.2"
+
     KNOWN_MODELS: List[str] = [
-        "claude-sonnet-4.5",
+        "auto",
+        "gpt-5.2",
+        "gpt-5.4",
+        "sonnet-4.6",
+        "opus-4.7",
         "gpt-5",
+        "claude-sonnet-4.5",
         "claude-opus-4.1",
         "gemini-2.5-flash（未修复，不可用）",
         "gemini-2.5-pro（未修复，不可用）",
         "gpt-4.1"
     ]
-    
+
     # 【最终修正】根据您提供的信息，填充所有模型的真实后台名称
     MODEL_MAP: dict = {
-        "claude-sonnet-4.5": "anthropic-sonnet-alt",
-        "gpt-5": "openai-turbo",
-        "claude-opus-4.1": "anthropic-opus-4.1",
+        "auto": "",
+        "gpt-5.2": "oatmeal-cookie",
+        "gpt-5.4": "oval-kumquat-medium",
+        "sonnet-4.6": "almond-croissant-low",
+        "opus-4.7": "apricot-sorbet-medium",
+        "gpt-5": "oatmeal-cookie",
+        "claude-sonnet-4.5": "oatmeal-cookie",
+        "claude-opus-4.1": "apricot-sorbet-medium",
         "gemini-2.5-flash（未修复，不可用）": "vertex-gemini-2.5-flash",
         "gemini-2.5-pro（未修复，不可用）": "vertex-gemini-2.5-pro",
-        "gpt-4.1": "openai-gpt-4.1"
+        "gpt-4.1": "oatmeal-cookie"
     }
 
 settings = Settings()

@@ -42,6 +42,8 @@ async def chat_completions(request: Request) -> StreamingResponse:
     try:
         request_data = await request.json()
         return await provider.chat_completion(request_data)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
