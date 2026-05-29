@@ -1,37 +1,29 @@
-worker_processes auto;
-
-events {
-    worker_connections 1024;
+upstream notion_backend {
+    server 127.0.0.1:${APP_PORT};
 }
 
-http {
-    upstream notion_backend {
-        server 127.0.0.1:${APP_PORT};
-    }
+server {
+    listen ${NGINX_PORT};
+    server_name localhost;
 
-    server {
-        listen ${NGINX_PORT};
-        server_name localhost;
-
-        location / {
-            proxy_pass http://notion_backend;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
+    location / {
+        proxy_pass http://notion_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
             
-            # 【核心修正】增加代理超时时间，以应对Cloudflare挑战
-            proxy_connect_timeout 600s;
-            proxy_send_timeout 600s;
-            proxy_read_timeout 600s;
-            send_timeout 600s;
+        # 【核心修正】增加代理超时时间，以应对Cloudflare挑战
+        proxy_connect_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+        send_timeout 600s;
             
-            # 流式传输优化
-            proxy_buffering off;
-            proxy_cache off;
-            proxy_set_header Connection '';
-            proxy_http_version 1.1;
-            chunked_transfer_encoding off;
-        }
+        # 流式传输优化
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        chunked_transfer_encoding off;
     }
 }
