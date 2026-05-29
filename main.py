@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 provider = NotionAIProvider()
+_response_store: Dict[str, Dict[str, Any]] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -158,6 +159,35 @@ def _openai_error_payload(message: str, error_type: str = "api_error") -> Dict[s
         "usage": usage,
     }
 
+def _model_data(model_id: str) -> Dict[str, Any]:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "notion",
+        "usage": _chat_usage(),
+    }
+
+def _sse_data(data: Dict[str, Any]) -> bytes:
+    return f"data: {json.dumps(data)}\n\n".encode("utf-8")
+
+def _create_completion_object(request_id: str, model: str, text: str, usage: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "text": text,
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": _chat_usage(usage),
+    }
+
 def _create_response_object(response_id: str, model: str, content: str, usage: Dict[str, Any]) -> Dict[str, Any]:
     message_id = f"msg_{uuid.uuid4().hex}"
     return {
@@ -233,6 +263,73 @@ async def chat_completions(request: Request) -> StreamingResponse:
             content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
         )
 
+@app.post("/v1/completions", dependencies=[Depends(verify_api_key)])
+@app.post("/completions", dependencies=[Depends(verify_api_key)])
+async def completions(request: Request):
+    try:
+        request_data = await request.json()
+        prompt = request_data.get("prompt", request_data.get("input", ""))
+        prompt_text = _extract_openai_text(prompt)
+        if not prompt_text and prompt not in ("", None):
+            prompt_text = json.dumps(prompt, ensure_ascii=False)
+
+        model = request_data.get("model", settings.DEFAULT_MODEL)
+        chat_request = {
+            "model": model,
+            "stream": False,
+            "messages": [{"role": "user", "content": prompt_text}],
+        }
+        response = await provider.chat_completion(chat_request)
+        chat_data = json.loads(response.body.decode("utf-8"))
+        content = chat_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        usage = _chat_usage(chat_data.get("usage"))
+        completion_id = f"cmpl-{uuid.uuid4().hex}"
+
+        if request_data.get("stream"):
+            async def stream_generator():
+                if content:
+                    yield _sse_data({
+                        "id": completion_id,
+                        "object": "text_completion",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [
+                            {"text": content, "index": 0, "logprobs": None, "finish_reason": None}
+                        ],
+                        "usage": usage,
+                    })
+                yield _sse_data({
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {"text": "", "index": 0, "logprobs": None, "finish_reason": "stop"}
+                    ],
+                    "usage": usage,
+                })
+                yield _sse_data({
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [],
+                    "usage": usage,
+                })
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        return JSONResponse(content=_create_completion_object(completion_id, model, content, usage))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"处理 OpenAI Completions 请求时发生顶层错误: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
+        )
+
 @app.post("/v1/responses", dependencies=[Depends(verify_api_key)])
 @app.post("/responses", dependencies=[Depends(verify_api_key)])
 async def responses(request: Request):
@@ -246,6 +343,7 @@ async def responses(request: Request):
         usage = _responses_usage(chat_data.get("usage"))
         response_id = f"resp_{uuid.uuid4().hex}"
         response_data = _create_response_object(response_id, model, content, usage)
+        _response_store[response_id] = response_data
 
         if request_data.get("stream"):
             async def stream_generator():
@@ -314,10 +412,35 @@ async def responses(request: Request):
             content=_openai_error_payload(f"内部服务器错误: {str(e)}"),
         )
 
+@app.get("/v1/responses/{response_id}/input_items", dependencies=[Depends(verify_api_key)])
+@app.get("/responses/{response_id}/input_items", dependencies=[Depends(verify_api_key)])
+async def response_input_items(response_id: str):
+    return JSONResponse(content={
+        "object": "list",
+        "data": [],
+        "first_id": None,
+        "last_id": None,
+        "has_more": False,
+        "usage": _responses_usage(None),
+    })
+
+@app.get("/v1/responses/{response_id}", dependencies=[Depends(verify_api_key)])
+@app.get("/responses/{response_id}", dependencies=[Depends(verify_api_key)])
+async def retrieve_response(response_id: str):
+    response_data = _response_store.get(response_id)
+    if not response_data:
+        response_data = _create_response_object(response_id, settings.DEFAULT_MODEL, "", _responses_usage(None))
+    return JSONResponse(content=response_data)
+
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 @app.get("/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 async def list_models():
     return await provider.get_models()
+
+@app.get("/v1/models/{model_id}", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+@app.get("/models/{model_id}", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def retrieve_model(model_id: str):
+    return JSONResponse(content=_model_data(model_id))
 
 @app.get("/", summary="根路径")
 def root():
