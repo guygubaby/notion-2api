@@ -161,6 +161,25 @@ class NotionAIProvider(BaseProvider):
         for name, morsel in parsed.items():
             session.cookies.set(name, morsel.value, domain=".notion.so", path="/")
 
+    def _estimate_usage(self, request_data: Dict[str, Any], completion: str) -> Dict[str, int]:
+        prompt_text = ""
+        for message in request_data.get("messages", []):
+            content = message.get("content", "")
+            if isinstance(content, str):
+                prompt_text += content
+            elif isinstance(content, list):
+                prompt_text += json.dumps(content, ensure_ascii=False)
+
+        input_tokens = max(0, len(prompt_text) // 4)
+        output_tokens = max(0, len(completion) // 4)
+        return {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+
     async def chat_completion(self, request_data: Dict[str, Any]):
         stream = request_data.get("stream", True)
         request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -242,7 +261,8 @@ class NotionAIProvider(BaseProvider):
                     chunk = create_chat_completion_chunk(request_id, model_name, content=cleaned_response)
                     yield create_sse_data(chunk)
 
-                final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop")
+                usage = self._estimate_usage(request_data, cleaned_response)
+                final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop", usage=usage)
                 yield create_sse_data(final_chunk)
                 yield DONE_CHUNK
 
@@ -257,7 +277,8 @@ class NotionAIProvider(BaseProvider):
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
         model_name, cleaned_response = await collect_response()
-        return JSONResponse(content=create_chat_completion_response(request_id, model_name, cleaned_response))
+        usage = self._estimate_usage(request_data, cleaned_response)
+        return JSONResponse(content=create_chat_completion_response(request_id, model_name, cleaned_response, usage=usage))
 
     async def _poll_final_response(self, thread_id: str) -> str:
         last_message_ids: List[str] = []
