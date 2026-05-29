@@ -39,6 +39,20 @@ def create_chat_completion_chunk(
         chunk["usage"] = usage
     return chunk
 
+def create_chat_completion_usage_chunk(
+    request_id: str,
+    model: str,
+    usage: Dict[str, int]
+) -> Dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [],
+        "usage": usage
+    }
+
 def create_chat_completion_response(
     request_id: str,
     model: str,

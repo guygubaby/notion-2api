@@ -16,7 +16,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.providers.base_provider import BaseProvider
-from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, create_chat_completion_response, DONE_CHUNK
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, create_chat_completion_response, create_chat_completion_usage_chunk, DONE_CHUNK
 
 # 设置日志记录器
 logger = logging.getLogger(__name__)
@@ -265,6 +265,7 @@ class NotionAIProvider(BaseProvider):
 
                 final_chunk = create_chat_completion_chunk(request_id, model_name, finish_reason="stop", usage=usage)
                 yield create_sse_data(final_chunk)
+                yield create_sse_data(create_chat_completion_usage_chunk(request_id, model_name, usage))
                 yield DONE_CHUNK
 
             except Exception as e:
