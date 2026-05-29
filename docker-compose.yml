@@ -9,6 +9,7 @@ services:
       - .env
     environment:
       NGINX_PORT: ${NGINX_PORT:-4002}
+      APP_PORT: ${APP_PORT:-4003}
     volumes:
       - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
     depends_on:
@@ -23,3 +24,6 @@ services:
     network_mode: host
     env_file:
       - .env
+    environment:
+      APP_PORT: ${APP_PORT:-4003}
+    command: ["sh", "-c", "uvicorn main:app --host 127.0.0.1 --port ${APP_PORT:-4003} --workers 4"]

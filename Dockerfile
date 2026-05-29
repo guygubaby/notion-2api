@@ -30,5 +30,5 @@ RUN useradd --create-home appuser && \
 USER appuser
 
 # 暴露端口并启动
-EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+EXPOSE 4003
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${APP_PORT:-4003} --workers 4"]

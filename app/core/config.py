@@ -30,6 +30,7 @@ class Settings(BaseSettings):
 
     API_REQUEST_TIMEOUT: int = 180
     NGINX_PORT: int = 4002
+    APP_PORT: int = 4003
 
     # 【最终修正】更新所有已知的模型列表
     DEFAULT_MODEL: str = "gpt-5.2"

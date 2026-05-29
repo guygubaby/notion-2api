@@ -160,6 +160,7 @@ graph TD
    
    # 部署配置，host 网络模式下 nginx 直接监听这个宿主机端口
    NGINX_PORT=4002
+   APP_PORT=4003
    
    # Notion 凭证（必需）
    # 建议填写浏览器请求里的完整 Cookie；只填 token_v2 可能无法访问 Notion AI 接口
