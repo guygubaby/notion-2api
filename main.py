@@ -304,6 +304,27 @@ def _create_anthropic_message(message_id: str, model: str, content: str, usage: 
 def _anthropic_sse_event(event: str, data: Dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
 
+def _log_usage_shape(route: str, payload: Dict[str, Any]):
+    usage = payload.get("usage")
+    logger.info(
+        "兼容响应 %s: type=%s object=%s model=%s usage_keys=%s",
+        route,
+        payload.get("type"),
+        payload.get("object"),
+        payload.get("model"),
+        sorted(usage.keys()) if isinstance(usage, dict) else None,
+    )
+
+def _log_incoming_model_request(route: str, request_data: Dict[str, Any]):
+    logger.info(
+        "兼容请求 %s: model=%s stream=%s max_tokens=%s messages=%s",
+        route,
+        request_data.get("model"),
+        request_data.get("stream"),
+        request_data.get("max_tokens"),
+        len(request_data.get("messages", [])) if isinstance(request_data.get("messages"), list) else None,
+    )
+
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     error_type = "invalid_request_error" if exc.status_code == 404 else "api_error"
@@ -324,7 +345,14 @@ async def request_validation_exception_handler(request: Request, exc: RequestVal
 async def chat_completions(request: Request) -> StreamingResponse:
     try:
         request_data = await request.json()
-        return await provider.chat_completion(request_data)
+        _log_incoming_model_request("/v1/chat/completions", request_data)
+        response = await provider.chat_completion(request_data)
+        if isinstance(response, JSONResponse):
+            try:
+                _log_usage_shape("/v1/chat/completions", json.loads(response.body.decode("utf-8")))
+            except Exception:
+                logger.info("兼容响应 /v1/chat/completions: 无法解析 JSON body")
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -339,6 +367,7 @@ async def chat_completions(request: Request) -> StreamingResponse:
 async def messages_count_tokens(request: Request):
     try:
         request_data = await request.json()
+        _log_incoming_model_request("/v1/messages/count_tokens", request_data)
         input_tokens = _estimate_input_tokens_from_messages(request_data)
         return JSONResponse(content={
             "input_tokens": input_tokens,
@@ -359,6 +388,7 @@ async def messages_count_tokens(request: Request):
 async def messages(request: Request):
     try:
         request_data = await request.json()
+        _log_incoming_model_request("/v1/messages", request_data)
         chat_request = _messages_to_chat_request(request_data)
         response = await provider.chat_completion(chat_request)
         chat_data = json.loads(response.body.decode("utf-8"))
@@ -387,12 +417,13 @@ async def messages(request: Request):
                 yield _anthropic_sse_event("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"output_tokens": usage["output_tokens"]},
+                    "usage": usage,
                 })
-                yield _anthropic_sse_event("message_stop", {"type": "message_stop"})
+                yield _anthropic_sse_event("message_stop", {"type": "message_stop", "usage": usage})
 
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
+        _log_usage_shape("/v1/messages", message_data)
         return JSONResponse(content=message_data)
     except HTTPException:
         raise
@@ -577,19 +608,23 @@ async def retrieve_response(response_id: str):
 async def list_models(request: Request):
     if _is_anthropic_request(request):
         data = [_anthropic_model_data(name) for name in settings.KNOWN_MODELS]
+        logger.info("兼容请求 /v1/models: anthropic=true count=%s", len(data))
         return JSONResponse(content={
             "data": data,
             "has_more": False,
             "first_id": data[0]["id"] if data else None,
             "last_id": data[-1]["id"] if data else None,
         })
+    logger.info("兼容请求 /v1/models: anthropic=false")
     return await provider.get_models()
 
 @app.get("/v1/models/{model_id}", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 @app.get("/models/{model_id}", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
 async def retrieve_model(model_id: str, request: Request):
     if _is_anthropic_request(request):
+        logger.info("兼容请求 /v1/models/%s: anthropic=true", model_id)
         return JSONResponse(content=_anthropic_model_data(model_id))
+    logger.info("兼容请求 /v1/models/%s: anthropic=false", model_id)
     return JSONResponse(content=_model_data(model_id))
 
 @app.get("/", summary="根路径")
